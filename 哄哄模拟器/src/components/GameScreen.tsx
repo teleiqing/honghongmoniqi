@@ -112,11 +112,14 @@ export function GameScreen({ gender, voiceType, scenario, onRestart }: GameScree
   });
 
   const [lastScoreChange, setLastScoreChange] = useState<number | undefined>();
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
 
   // 生成第一轮对话
   const generateFirstRound = useCallback(async () => {
+    setErrorMessage(null);
+    setGameState(prev => ({ ...prev, isGenerating: true }));
     try {
       const response = await fetch('/api/game', {
         method: 'POST',
@@ -131,6 +134,10 @@ export function GameScreen({ gender, voiceType, scenario, onRestart }: GameScree
         }),
       });
 
+      if (!response.ok) {
+        const details = await response.json().catch(() => ({}));
+        throw new Error(typeof details.error === 'string' ? details.error : '请求失败，请稍后再试');
+      }
       const data: GenerateResponse = await response.json();
 
       const firstMessage: ChatMessage = {
@@ -156,6 +163,7 @@ export function GameScreen({ gender, voiceType, scenario, onRestart }: GameScree
       }
     } catch (error) {
       console.error('生成对话失败:', error);
+      setErrorMessage(error instanceof Error ? error.message : '生成失败，请稍后重试');
       setGameState(prev => ({ ...prev, isGenerating: false }));
     }
   }, [scenario, gender, voiceType]);
@@ -167,6 +175,8 @@ export function GameScreen({ gender, voiceType, scenario, onRestart }: GameScree
 
   // 处理用户选择选项
   const handleSelectOption = async (option: Option) => {
+    const previousOptions = gameState.currentOptions;
+    setErrorMessage(null);
     setGameState(prev => ({ ...prev, isGenerating: true }));
     setLastScoreChange(undefined);
 
@@ -191,13 +201,23 @@ export function GameScreen({ gender, voiceType, scenario, onRestart }: GameScree
           scenario,
           gender,
           voiceType,
-          history: [...gameState.messages, userMessage],
+          // Do not send previously generated base64 audio back to the API.
+          history: [...gameState.messages, userMessage].map(({ id, role, content, timestamp }) => ({
+            id,
+            role,
+            content,
+            timestamp,
+          })),
           currentScore: gameState.score,
           currentRound: gameState.round,
           userChoice: option.text,
         }),
       });
 
+      if (!response.ok) {
+        const details = await response.json().catch(() => ({}));
+        throw new Error(typeof details.error === 'string' ? details.error : '请求失败，请稍后再试');
+      }
       const data: GenerateResponse = await response.json();
 
       const partnerMessage: ChatMessage = {
@@ -236,7 +256,14 @@ export function GameScreen({ gender, voiceType, scenario, onRestart }: GameScree
       }
     } catch (error) {
       console.error('生成对话失败:', error);
-      setGameState(prev => ({ ...prev, isGenerating: false }));
+      setErrorMessage(error instanceof Error ? error.message : '生成失败，请稍后重试');
+      // Restore the choices so that a temporary 429 does not end the game.
+      setGameState(prev => ({
+        ...prev,
+        messages: prev.messages.filter((message) => message.id !== userMessage.id),
+        currentOptions: previousOptions,
+        isGenerating: false,
+      }));
     }
   };
 
@@ -337,6 +364,22 @@ export function GameScreen({ gender, voiceType, scenario, onRestart }: GameScree
                 <span className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: '300ms' }} />
               </div>
             </div>
+          </div>
+        )}
+
+        {errorMessage && !gameState.isGenerating && (
+          <div role="alert" className="mx-auto my-4 max-w-sm rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            <p>{errorMessage}</p>
+            {gameState.round === 0 ? (
+              <button
+                onClick={generateFirstRound}
+                className="mt-3 rounded-lg bg-amber-600 px-4 py-2 font-medium text-white"
+              >
+                稍后重试
+              </button>
+            ) : (
+              <p className="mt-2 text-xs">稍等片刻后重新选择下面的回复即可。</p>
+            )}
           </div>
         )}
       </div>

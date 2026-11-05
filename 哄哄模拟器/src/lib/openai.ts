@@ -35,6 +35,7 @@ export async function invokeChatCompletion(
     model: options?.model ?? process.env.OPENAI_MODEL ?? 'gpt-4o-mini',
     messages,
     temperature: options?.temperature ?? 0.8,
+    max_completion_tokens: 1100,
   });
 
   return response.choices[0]?.message?.content ?? '';

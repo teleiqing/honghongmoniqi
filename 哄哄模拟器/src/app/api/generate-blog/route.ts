@@ -1,10 +1,49 @@
 import { NextRequest } from 'next/server';
+import { z } from 'zod';
 import { invokeChatCompletion } from '@/lib/openai';
 import { createPost } from '@/lib/blog';
+import { checkRateLimit, readLimitedJson, RequestError, reserveAISlot, verifyBearerToken } from '@/lib/request-security';
+
+const blogInputSchema = z.object({ topic: z.string().trim().max(160).optional() });
+const blogOutputSchema = z.object({
+  title: z.string().trim().min(1).max(200),
+  summary: z.string().trim().min(1).max(500),
+  content: z.string().trim().min(1).max(12_000),
+});
 
 export async function POST(request: NextRequest) {
+  // Fail closed: the blog writer stays disabled until a secret is configured.
+  const adminToken = process.env.BLOG_ADMIN_TOKEN;
+  if (!adminToken || Buffer.byteLength(adminToken, 'utf8') < 32) {
+    return Response.json({ success: false, error: '文章生成功能未启用' }, { status: 503 });
+  }
+  if (!verifyBearerToken(request, adminToken)) {
+    return Response.json({ success: false, error: '没有管理员权限' }, { status: 401 });
+  }
+
+  const retryAfter = checkRateLimit(request, 'blog');
+  if (retryAfter !== null) {
+    return Response.json(
+      { success: false, error: '请求太频繁，请稍后重试' },
+      { status: 429, headers: { 'Retry-After': String(retryAfter) } },
+    );
+  }
+
+  const releaseSlot = reserveAISlot();
+  if (!releaseSlot) {
+    return Response.json(
+      { success: false, error: '服务器繁忙，请稍后重试' },
+      { status: 429, headers: { 'Retry-After': '10' } },
+    );
+  }
+
   try {
-    const { topic } = await request.json() as { topic?: string };
+    const input = await readLimitedJson(request, 1_024);
+    const validated = blogInputSchema.safeParse(input);
+    if (!validated.success) {
+      return Response.json({ success: false, error: '文章主题格式不正确' }, { status: 400 });
+    }
+    const { topic } = validated.data;
 
     const systemPrompt = `你是一位恋爱博主，专门写恋爱沟通技巧的文章。
 你的写作风格轻松幽默，像跟朋友聊天一样，不要太说教。
@@ -69,22 +108,32 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    if (!result.title || !result.summary || !result.content) {
-      throw new Error('生成的文章缺少必要字段');
+    const postData = blogOutputSchema.safeParse(result);
+    if (!postData.success) {
+      throw new Error('生成的文章不符合保存格式');
     }
 
     // 保存到数据库
-    const post = await createPost(result.title, result.summary, result.content);
+    const post = await createPost(
+      postData.data.title,
+      postData.data.summary,
+      postData.data.content,
+    );
 
     return Response.json({
       success: true,
       data: post,
     });
   } catch (error) {
+    if (error instanceof RequestError) {
+      return Response.json({ success: false, error: error.message }, { status: error.status });
+    }
     console.error('生成文章失败:', error);
     return Response.json(
       { success: false, error: '生成文章失败' },
       { status: 500 }
     );
+  } finally {
+    releaseSlot();
   }
 }

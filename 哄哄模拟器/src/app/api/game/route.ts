@@ -1,16 +1,65 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { z } from 'zod';
 import { invokeChatCompletion, synthesizeSpeech, type ChatMessage } from '@/lib/openai';
+import { checkRateLimit, readLimitedJson, RequestError, reserveAISlot } from '@/lib/request-security';
 import {
   GenerateRequest,
   GenerateResponse,
   Option,
   getEmotionStage,
+  SCENARIOS,
   SCORE_THRESHOLDS,
 } from '@/types/game';
 
+const gameRequestSchema = z.object({
+  gender: z.enum(['girlfriend', 'boyfriend']),
+  voiceType: z.enum(['gentle_female', 'dominant_female', 'cute_female', 'deep_male', 'gentle_male']),
+  scenario: z.object({
+    id: z.string().min(1).max(80),
+    title: z.string().max(120),
+    description: z.string().max(500),
+  }),
+  history: z.array(z.object({
+    id: z.string().max(80),
+    role: z.enum(['partner', 'user']),
+    content: z.string().max(700),
+    timestamp: z.number().finite(),
+  })).max(24),
+  currentScore: z.number().int().min(-50).max(100),
+  currentRound: z.number().int().min(0).max(10),
+  userChoice: z.string().max(700).optional(),
+});
+
 export async function POST(request: NextRequest) {
+  const retryAfter = checkRateLimit(request, 'game');
+  if (retryAfter !== null) {
+    return NextResponse.json(
+      { error: '请求太频繁，请稍后再试' },
+      { status: 429, headers: { 'Retry-After': String(retryAfter) } },
+    );
+  }
+
+  const releaseSlot = reserveAISlot();
+  if (!releaseSlot) {
+    return NextResponse.json(
+      { error: '当前使用人数较多，请稍后再试' },
+      { status: 429, headers: { 'Retry-After': '10' } },
+    );
+  }
+
   try {
-    const body: GenerateRequest = await request.json();
+    const input = await readLimitedJson(request, 16_384);
+    const result = gameRequestSchema.safeParse(input);
+    if (!result.success) {
+      return NextResponse.json({ error: '游戏参数不正确' }, { status: 400 });
+    }
+
+    // Use only server-defined scenarios; a client cannot inject an oversized prompt.
+    const scenario = SCENARIOS.find((item) => item.id === result.data.scenario.id);
+    if (!scenario) {
+      return NextResponse.json({ error: '未知游戏场景' }, { status: 400 });
+    }
+    const body: GenerateRequest = { ...result.data, scenario };
 
     // 构建系统提示
     const systemPrompt = buildSystemPrompt(body);
@@ -29,7 +78,7 @@ export async function POST(request: NextRequest) {
     // 生成语音
     let audioUri: string | undefined;
     try {
-      audioUri = await synthesizeSpeech(parsed.partnerMessage, body.voiceType);
+      audioUri = await synthesizeSpeech(parsed.partnerMessage.slice(0, 450), body.voiceType);
     } catch (ttsError) {
       console.error('TTS generation failed:', ttsError);
       // 不阻断游戏流程，语音失败时继续返回文本
@@ -44,13 +93,18 @@ export async function POST(request: NextRequest) {
       audioUri,
     };
 
-    return NextResponse.json(response);
+    return NextResponse.json(response, { headers: { 'Cache-Control': 'no-store' } });
   } catch (error) {
+    if (error instanceof RequestError) {
+      return NextResponse.json({ error: error.message }, { status: error.status });
+    }
     console.error('Game API error:', error);
     return NextResponse.json(
       { error: '生成对话失败，请稍后重试' },
       { status: 500 }
     );
+  } finally {
+    releaseSlot();
   }
 }
 
